@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.2
+// @version      1.10.3
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -18,7 +18,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.2';
+  const VERSION = '1.10.3';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -810,6 +810,16 @@
     // 不要用 innerHTML 清空（会留下多余的 <body>，导致正文“看不见”）
     const body = doc.createElement('body');
     while (main.firstChild) body.appendChild(main.firstChild); // 不保留外层包装 div
+    // 标题下附上原文地址，离线回看时能直接跳回原页面
+    const src = doc.createElement('p');
+    src.className = 'spf-src';
+    const a = doc.createElement('a');
+    a.href = location.href;
+    a.textContent = location.href;
+    src.appendChild(a);
+    const first = body.firstElementChild;
+    if (first && /^H[1-6]$/.test(first.tagName)) first.insertAdjacentElement('afterend', src);
+    else body.insertBefore(src, body.firstChild);
     doc.documentElement.replaceChildren(articleHead(doc), body);
   }
 
@@ -832,6 +842,8 @@
       'h2{font-size:22px;line-height:1.5;margin:1.4em 0 .6em}' +
       'h3{font-size:19px;line-height:1.5;margin:1.2em 0 .5em}' +
       'img,video{max-width:100%;height:auto}' +
+      '.spf-src{font-size:13px;color:#57606a;margin:-.2em 0 1.4em;word-break:break-all}' +
+      '.spf-src a{color:#0969da;text-decoration:none}' +
       'p,div{margin:0 0 1em}' +
       'pre{overflow:auto;background:#f6f8fa;padding:12px;border-radius:6px}' +
       'code{font-family:ui-monospace,Consolas,monospace}' +
