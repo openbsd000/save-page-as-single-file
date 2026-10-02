@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.3
+// @version      1.10.4
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -18,7 +18,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.3';
+  const VERSION = '1.10.4';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -823,6 +823,31 @@
     doc.documentElement.replaceChildren(articleHead(doc), body);
   }
 
+  /* 知乎这类站点的公式渲染器会同时留下一份渲染好的 <math> 和一份 LaTeX 源码副本
+     （源码副本靠原页面 CSS 藏起来）。正文模式把原页面 CSS 全删了，副本就露出
+     来变成满屏 \frac、\begin 源码。这里给它加 hidden，只留渲染结果。
+     限定条件很窄：叶子节点 + 内容是 LaTeX + 同一父级（或祖父级）里确实有 <math>，
+     避免误伤讨论 LaTeX 的正文段落 */
+  const TEX_SRC_RE = /\\[A-Za-z]+|_\{|\^\{/;
+  function hideTexSource(root) {
+    if (!root || !root.querySelectorAll) return 0;
+    let n = 0;
+    root.querySelectorAll('*').forEach(el => {
+      if (el.children.length || el.tagName === 'MATH') return;
+      if (el.closest && (el.closest('math') || el.closest('pre') || el.closest('code'))) return;
+      const t = el.textContent || '';
+      if (!t || t.length > 400 || !TEX_SRC_RE.test(t)) return;
+      let p = el.parentNode, near = false;
+      for (let k = 0; k < 2 && p && p.querySelector; k++, p = p.parentNode) {
+        if (p.querySelector('math')) { near = true; break; }
+      }
+      if (!near) return;
+      el.setAttribute('hidden', '');
+      n++;
+    });
+    return n;
+  }
+
   function articleHead(doc) {
     const head = doc.createElement('head');
     const add = (tag, attrs, text) => {
@@ -1076,6 +1101,8 @@
           log('未识别到正文，按整页保存');
         } else {
           extractArticle(doc, main);
+          const hid = hideTexSource(doc.body);
+          if (hid) note('公式：隐藏 ' + hid + ' 处 LaTeX 源码副本，保留渲染好的 <math>');
         }
       }
 
