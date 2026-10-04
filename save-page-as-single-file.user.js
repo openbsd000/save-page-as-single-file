@@ -2,10 +2,11 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.4
+// @version      1.10.5
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
+// @grant        GM.xmlHttpRequest
 // @grant        GM.xmlhttpRequest
 // @grant        GM_xmlhttpRequest
 // @grant        GM.registerMenuCommand
@@ -18,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.4';
+  const VERSION = '1.10.5';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -48,16 +49,10 @@
      Tampermonkey: GM.xmlHttpRequest / GM_xmlhttpRequest（部分版本还有 GM.xmlhttpRequest）
      Violentmonkey: GM.xmlHttpRequest + 下划线版，没有小写 r 的点号版 */
   function pickGm() {
-    const cands = [];
-    try {
-      if (typeof GM === 'object' && GM) cands.push(GM.xmlHttpRequest, GM.xmlhttpRequest, GM.XMLHttpRequest);
-    } catch (e) { /* 忽略 */ }
-    try {
-      if (typeof GM_xmlhttpRequest !== 'undefined') cands.push(GM_xmlhttpRequest);
-      if (typeof GM_xmlHttpRequest !== 'undefined') cands.push(GM_xmlHttpRequest);
-    } catch (e) { /* 忽略 */ }
-    for (const f of cands) if (typeof f === 'function') return f;
-    return null;
+    // 每个名字单独 try：未授权时读这个属性会抛，一个抛了不能连累后面几个
+    const one = get => { try { const f = get(); return typeof f === 'function' ? f : null; } catch (e) { return null; } };
+    return one(() => GM.xmlHttpRequest) || one(() => GM.xmlhttpRequest) ||
+      one(() => GM.XMLHttpRequest) || one(() => GM_xmlhttpRequest) || one(() => GM_xmlHttpRequest);
   }
   const gmXhr = pickGm();
   console.log('[SPF] GM.xmlHttpRequest: ' + (gmXhr ? '可用' : '不可用（脚本管理器没给跨域权限）'));
@@ -73,10 +68,14 @@
   const baseEl = document.querySelector('base[href]');
   const BASE = baseEl ? baseEl.href : location.href;
 
+  const FILE_PAGE = location.protocol === 'file:';
   function toAbs(raw, base) {
     if (!raw) return '';
     raw = raw.trim();
     if (!raw || /^(data|blob|about|javascript|chrome|moz-extension):/i.test(raw) || raw.charAt(0) === '#') return '';
+    // 网页里的 file:// 地址浏览器一律拒绝加载（控制台刷“安全错误：…不可以加载或者链接至 file:///”），
+    // 不去碰它；只有页面本身就是本地文件时才照常处理
+    if (!FILE_PAGE && /^file:/i.test(raw)) return '';
     try { return new URL(raw, base || BASE).href; } catch (e) { return ''; }
   }
 
@@ -1190,7 +1189,7 @@
         const release = await hostSlot(url);
         try { res = await fetchBuf(url, BASE); } finally { release(); }
         if (res && res.rateLimit && !limited++) note('该站点限流(429)，已放慢速度');
-        if ((!res || !res.buf) && !res.rateLimit && CFG.retry > 0) {
+        if ((!res || !res.buf) && !(res && res.rateLimit) && CFG.retry > 0) {
           const alts = altUrls(url);                                   // 换 CDN 域名再试一次
           for (let k = 0; k < alts.length && (!res || !res.buf); k++) {
             const release = await hostSlot(alts[k]);
