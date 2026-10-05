@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.5
+// @version      1.10.6
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.5';
+  const VERSION = '1.10.6';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -673,7 +673,10 @@
     const SECTION_RE = /精选|栏目|列表|推荐|热门|相关|更多|专题|标签|阅读|评论|关注/;
     const okBlock = el => {
       const t = norm(el.textContent).length;
-      const img = !!el.querySelector('img') || el.tagName === 'IMG';
+      // 只有几乎没文字的块才算“图片行”；正文段落里夹一张图、末尾再挂几条参考链接时
+      // 链接密度会轻易超过 0.4，按图片行的严格标准判会把整段正文（和那张图）一起丢掉。
+      // 判定要和下面 kind() 保持一致
+      const img = el.tagName === 'IMG' || (t < 40 && !!el.querySelector('img'));
       const lt = linkTextOf(el);
       if (img) return t === 0 || lt / t < 0.4;  // 正文图：纯图行或低文案
       if (t < 20) return false;                  // 碎屑（含空行）
