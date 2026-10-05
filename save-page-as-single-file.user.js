@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.6
+// @version      1.10.9
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.6';
+  const VERSION = '1.10.9';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -407,6 +407,8 @@
   let fontCssText = '';
   const fontCssUrls = new Set();
   let fontCssDown = [];      // 下载回来的外链 CSS：[{url, text}]
+  // 本次正文里有没有公式 / 代码 / 表格：决定要不要把对应的原文样式一起留下来
+  let articleFlags = { math: false, code: false, table: false };
 
   function tok(s) {
     const out = [];
@@ -434,6 +436,25 @@
     // 猜“正文用到哪个 family”很容易漏，漏一个就是方块字。数量由下面的上限兜住。
     const FACE_CAP = 40;
     let faceKept = 0;
+    // 正文里有公式 / 代码 / 表格时，光留 @font-face 不够：
+    // 公式会散成没有上下标、没有根号的一行乱字，代码会丢掉高亮配色，表格会丢掉边框表头
+    const isMathRule = sel => articleFlags.math && /\.(katex|MathJax|mjx)/i.test(sel || '');
+    const isCodeRule = sel => articleFlags.code &&
+      /(\.token|\.hljs|\.highlight|language-|(^|[>\s,])(pre|code)([.\[:,\s>]|$))/i.test(sel || '');
+    const isTableRule = sel => articleFlags.table &&
+      /(^|[>\s,.])(\btable|\bthead|\btbody|\btr|\btd|\bth)\b/i.test(sel || '');
+    // 同一字体常常同时给出 woff2 / woff / ttf 三份（KaTeX 一套就有 20 个 family），
+    // 全内联会让文件平白胖几 MB。有 woff2 就只留它，后面那些备选源去掉：
+    // 浏览器按 src 顺序挑，woff2 本来就排在最前面
+    const trimFace = t => {
+      const m = /format\(\s*["']?woff2/i.exec(t);
+      if (!m) return t;
+      const brace = t.indexOf('}', m.index);
+      if (brace < 0) return t;
+      const comma = t.indexOf(',', m.index);
+      const cut = (comma > 0 && comma < brace) ? comma : brace;
+      return t.slice(0, cut) + t.slice(brace);
+    };
     // a) 能直接读到的样式表（同源，或扩展已开 web-access）
     for (const sheet of Array.from(document.styleSheets)) {
       let rs = null;
@@ -442,9 +463,11 @@
         const t = (r.cssText || '').trim();
         if (!t) continue;
         if (r.type === CSSRule.FONT_FACE_RULE) {
-          if (faceKept++ < FACE_CAP) keep(t);
+          if (faceKept++ < FACE_CAP) keep(trimFace(t));
         } else if (r.selectorText && /\S::?(before|after)/i.test(r.selectorText)) {
           if (selTokens(r.selectorText).some(x => savedTokens.has(x))) keep(t);
+        } else if (isMathRule(r.selectorText) || isCodeRule(r.selectorText) || isTableRule(r.selectorText)) {
+          keep(t);
         }
       }
     }
@@ -455,7 +478,7 @@
       const blockRe = /@font-face\s*\{[^}]*\}/gi;
       let m;
       while ((m = blockRe.exec(txt)) !== null) {
-        if (faceKept++ < FACE_CAP) keep(m[0]);
+        if (faceKept++ < FACE_CAP) keep(trimFace(m[0]));
       }
       // 伪元素规则：逐块扫描（知乎的 CSS 常带换行，不能只按单行匹配）
       let i = 0;
@@ -472,6 +495,8 @@
         // 上一层块的收尾符会粘连在选择器前面，切掉
         sel = sel.slice(Math.max(sel.lastIndexOf('}'), sel.lastIndexOf(';')) + 1).trim();
         if (/\S::?(before|after)/i.test(sel) && selTokens(sel).some(x => savedTokens.has(x))) {
+          keep(sel + txt.slice(b, e).replace(/\s*\n\s*/g, ''));
+        } else if (isMathRule(sel) || isCodeRule(sel) || isTableRule(sel)) {
           keep(sel + txt.slice(b, e).replace(/\s*\n\s*/g, ''));
         }
         // 前进到 b+1 而不是 e：这样 @media / @supports 里的规则也能被扫到
@@ -688,12 +713,23 @@
     //    老式排版常见的 <div><table><tr><td>段落</td></tr></table></div> 会被钻到 td
     const TEXT_LEAF_RE = /^(P|PRE|BLOCKQUOTE|IMG|DIV|SPAN|FONT|TD|LI|DT|DD|H[1-6])$/;
     const INNER_BLOCK = 'div,p,table,ul,ol,section,article,main,td,li,blockquote,pre,h1,h2,h3';
+    // 代码块和表格的样式写在“外层 class + 内层标签”的组合选择器上
+    // （如 .markdown_views .prism .token.comment / .markdown_views table tr），
+    // 拆成一段段 <p> 就再也命中不了，所以这两种整块保留、不往下钻
+    const CODE_BOX_RE = /(prism|highlight|hljs|prettyprint|syntax|language-|code)/i;
     const blocks = [];
     (function walk(node) {
       Array.from(node.children).forEach(c => {
         if (c.hasAttribute('data-spf-start') || c === hTitle) return; // 标题单独放在最前面
         if (!inWindow(c)) { walk(c); return; } // 罩住别篇文章的容器：钻进去继续找
         if (c.tagName === 'IMG') { blocks.push(c); return; }
+        if (c.tagName === 'TABLE' && (c.querySelectorAll('tr').length >= 2 ||
+            norm(c.textContent).length >= 80)) { blocks.push(c); return; }
+        if (/^(DIV|FIGURE|SECTION)$/.test(c.tagName) && CODE_BOX_RE.test(cls(c)) &&
+            c.querySelector('pre,code') &&
+            !c.querySelector('p,h1,h2,h3,h4,h5,h6,li,blockquote,table')) {
+          blocks.push(c); return;   // 纯代码块外壳（里面除了代码没有别的正文）
+        }
         if (TEXT_LEAF_RE.test(c.tagName) && !(c.querySelector && c.querySelector(INNER_BLOCK)) &&
             (c.textContent || '').trim()) {
           blocks.push(c);
@@ -749,21 +785,36 @@
     for (let i = tailFrom; i <= last; i++) keep[i] = true; // 文尾那几行不管链接密度都留
     const inSpan = (el, i) => keep[i] && (i >= tailFrom || kind[i] === 1 || okBlock(el));
     const kept = blocks.filter(inSpan);
+    // 清洗会剥掉 class，所以要在清洗前判断正文里有没有这三类内容
+    const hasKept = sel => kept.some(el => (el.matches && el.matches(sel)) || el.querySelector(sel));
+    articleFlags = {
+      math: hasKept('.katex,.MathJax,.mjx-chtml,.mjx-container,math'),
+      code: hasKept('pre,code,.hljs,.highlight,[class*=language-]'),
+      table: hasKept('table')
+    };
     // 输出时统一“脱壳”：td/li/span 之类的单元格块改写成 <p>，并去掉排版属性，
     // 免得老站用表格排版时段落在纯净页面里变成一格一格的方框
     const LAYOUT_ATTRS = ['class', 'id', 'align', 'valign', 'border', 'cellpadding',
       'cellspacing', 'bgcolor', 'width', 'height', 'hspace', 'vspace', 'itemprop', 'role'];
+    // 公式（KaTeX / MathJax）、代码块、表格全靠 class 和内联 style 排版，
+    // 剥掉就散成一行乱字符 / 丢掉高亮和边框，所以这些子树整体跳过清洗，
+    // 让上面按同样关键字挑出来的原文 CSS 能命中
+    const KEEP_SEL = '.katex,.MathJax,.MathJax_Display,.MathJax_SVG,.mjx-container,.mjx-chtml,math,' +
+      'pre,code,.hljs,.highlight,[class*=language-],table,thead,tbody,tfoot,tr,td,th,col,colgroup,caption';
     const cleanLayout = root => {
       const els = root.tagName === 'IMG' ? [root] : [root].concat(Array.from(root.querySelectorAll('*')));
       els.forEach(el => {
-        LAYOUT_ATTRS.forEach(a => {
-          if (el.tagName === 'IMG' && (a === 'width' || a === 'height')) return;
+        const math = !!(el.closest && el.closest(KEEP_SEL));
+        if (!math) LAYOUT_ATTRS.forEach(a => {
+          // width/height 是 <img> 和 <svg> 的固有尺寸：删掉后 SVG 会掉回 300×150 的
+          // 默认尺寸，公式里的重音/箭头小图标会被撑成一大块，所以这两个标签都豁免
+          if ((a === 'width' || a === 'height') && /^(IMG|svg)$/.test(el.tagName)) return;
           el.removeAttribute(a);
         });
         Array.from(el.attributes || []).forEach(at => {
           if (/^data-|^on/i.test(at.name)) el.removeAttribute(at.name);
         });
-        if (el.hasAttribute('style')) {
+        if (!math && el.hasAttribute('style')) {
           const rest = (el.getAttribute('style') || '')
             .split(';')
             .filter(d => d.trim() && !/^\s*(border|background|padding|margin|width|float|display|position|text-align)/i.test(d.trim()))
@@ -804,6 +855,13 @@
       ' 标题=' + (title ? norm(title.textContent).slice(0, 24) : '无') +
       ' 字数=' + remain + (remain < 200 ? ' → 不足200字，回退整页' : ''));
     if (remain < 200) return null;
+    // 正文里有公式 / 代码 / 表格时，把正文盒自己的 class/id 挂回外层包装：
+    // 原文那套组合选择器（.markdown_views .prism .token.comment、.markdown_views table）
+    // 前缀就写在它身上，没有前缀规则根本命中不到。没有这三类内容时保持原来的干净输出
+    if (articleFlags.math || articleFlags.code || articleFlags.table) {
+      if (best.id) wrap.id = best.id;
+      if (cls(best).trim()) wrap.className = cls(best).trim();
+    }
     return wrap;
   }
 
@@ -811,7 +869,7 @@
     // Document 只能有一个元素子节点 <html>；一次替换出唯一的一对 head/body，
     // 不要用 innerHTML 清空（会留下多余的 <body>，导致正文“看不见”）
     const body = doc.createElement('body');
-    while (main.firstChild) body.appendChild(main.firstChild); // 不保留外层包装 div
+    body.appendChild(main);   // 保留外层包装：它可能带着正文盒的 class/id，原文的组合选择器靠它命中
     // 标题下附上原文地址，离线回看时能直接跳回原页面
     const src = doc.createElement('p');
     src.className = 'spf-src';
@@ -819,7 +877,7 @@
     a.href = location.href;
     a.textContent = location.href;
     src.appendChild(a);
-    const first = body.firstElementChild;
+    const first = main.firstElementChild;
     if (first && /^H[1-6]$/.test(first.tagName)) first.insertAdjacentElement('afterend', src);
     else body.insertBefore(src, body.firstChild);
     doc.documentElement.replaceChildren(articleHead(doc), body);
@@ -1079,6 +1137,7 @@
       gmMissingWarned = false;
       canvasTried = 0; canvasSaved = 0;
       savedTokens = new Set();
+      articleFlags = { math: false, code: false, table: false };
       fontCssText = '';
       fontCssDown = [];
       fontCssUrls.clear();
@@ -1247,7 +1306,11 @@
       });
 
       for (const ci of cssItems) {
-        const text = convCss(ci.text || '', ci.base);
+        // 字体 / 公式样式是第 3b 步才写进占位 <style> 的（步骤 1 记录它时还是空的），
+        // 这里得按元素当前内容来做替换，否则会被当初记下的空文本覆盖掉
+        const isFontSlot = ci.el.getAttribute &&
+          ci.el.getAttribute('data-href') === '(正文用字体/图标样式)';
+        const text = convCss((isFontSlot ? ci.el.textContent : ci.text) || '', ci.base);
         if (ci.link) {
           const s = doc.createElement('style');
           s.setAttribute('data-href', ci.url || '');
