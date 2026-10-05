@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.9
+// @version      1.10.10
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.9';
+  const VERSION = '1.10.10';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -409,6 +409,7 @@
   let fontCssDown = [];      // 下载回来的外链 CSS：[{url, text}]
   // 本次正文里有没有公式 / 代码 / 表格：决定要不要把对应的原文样式一起留下来
   let articleFlags = { math: false, code: false, table: false };
+  let articleTitle = '';   // 正文模式定位到的文章标题，文件名优先用它
 
   function tok(s) {
     const out = [];
@@ -514,6 +515,10 @@
     let t = raw.replace(
       /^[\[(（【]?\s*(?:\d+\s*[封条个篇]\s*[\u4e00-\u9fa5]{2,4}\s*[/、,，]\s*)*\d+\s*[封条个篇]\s*[\u4e00-\u9fa5]{2,4}\s*[\])）】]\s*/, '');
     t = t.replace(/\s*[-|｜–—]\s*[\u4e00-\u9fa5A-Za-z0-9 ]{1,8}$/, '');
+    // CSDN 这类还会把“_专栏名”接在标题后面（"文章标题_stable diffusion-CSDN博客"），
+    // 文件名要的是文章标题本身。只在切掉后还剩至少 8 个字时才动刀，
+    // 免得把本来就带下划线的标题（"A_B"）砍掉一半
+    t = t.replace(/_[^_]{1,30}$/, m => (t.length - m.length >= 8 ? '' : m));
     return t.trim() || raw;
   }
 
@@ -846,7 +851,11 @@
       title = doc.createElement('h1');
       title.textContent = pageTitle();
     }
-    if (title) appendBlock(title);
+    if (title) {
+      // 文件名就用文章自己的标题，别用 document.title（站名/专栏名都挂在上面）
+      articleTitle = (title.textContent || '').replace(/\s+/g, ' ').trim();
+      appendBlock(title);
+    }
     kept.forEach(appendBlock);
     // 清洗后文字太少视为提取失败，交回上层回退整页
     const remain = Array.from(wrap.children)
@@ -1138,6 +1147,7 @@
       canvasTried = 0; canvasSaved = 0;
       savedTokens = new Set();
       articleFlags = { math: false, code: false, table: false };
+      articleTitle = '';
       fontCssText = '';
       fontCssDown = [];
       fontCssUrls.clear();
@@ -1356,7 +1366,7 @@
       const dt = document.doctype && document.doctype.name ? '<!DOCTYPE ' + document.doctype.name + '>' : '<!DOCTYPE html>';
       const html = dt + '\n' + doc.documentElement.outerHTML;
       const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-      const name = (pageTitle() || location.hostname || 'page')
+      const name = (articleTitle || pageTitle() || location.hostname || 'page')
         .replace(/[\\/:*?"<>|\n\r\t]+/g, '_').slice(0, 80) + '.html';
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
