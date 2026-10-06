@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.10
+// @version      1.10.11
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
 // @author       CodeBuddy
 // @match        *://*/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.10';
+  const VERSION = '1.10.11';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -716,7 +716,9 @@
     };
     // 5) 递归收集正文盒内的“叶子块”：只认“里面没有别的块级元素”的最内层文字块，
     //    老式排版常见的 <div><table><tr><td>段落</td></tr></table></div> 会被钻到 td
-    const TEXT_LEAF_RE = /^(P|PRE|BLOCKQUOTE|IMG|DIV|SPAN|FONT|TD|LI|DT|DD|H[1-6])$/;
+    // SECTION 也算文字块：不少站点（大道家园这类）正文就是一个个 <section>，
+    // 不认它的话整段正文会被“往下钻”钻没了，只剩里面的图片
+    const TEXT_LEAF_RE = /^(P|PRE|BLOCKQUOTE|IMG|DIV|SPAN|FONT|TD|LI|DT|DD|H[1-6]|SECTION)$/;
     const INNER_BLOCK = 'div,p,table,ul,ol,section,article,main,td,li,blockquote,pre,h1,h2,h3';
     // 代码块和表格的样式写在“外层 class + 内层标签”的组合选择器上
     // （如 .markdown_views .prism .token.comment / .markdown_views table tr），
@@ -1035,6 +1037,13 @@
   }
   function progress(p) { if (barEl) barEl.style.width = Math.max(0, Math.min(100, p * 100)) + '%'; }
 
+  // 勾选框自带的内联样式：有些站点把 input 整成 appearance:none / display:none，
+  // 只靠 #spf-css 会被同优先级的页面规则压过去，这里再内联一份带 !important 的兜底
+  const BOX_STYLE = ' style="appearance:checkbox!important;-webkit-appearance:checkbox!important;' +
+    'display:inline-block!important;visibility:visible!important;opacity:1!important;' +
+    'width:13px!important;height:13px!important;margin:0 6px 0 0!important;' +
+    'vertical-align:middle!important;accent-color:#0969da!important"';
+
   function buildUI() {
     const css = document.createElement('style');
     css.id = 'spf-css';
@@ -1051,6 +1060,12 @@
 #spf-close{cursor:pointer;font-size:16px;line-height:1;color:#888;padding:0 2px}
 #spf-body{padding:8px 10px 10px}
 #spf-body label{display:block;margin:4px 0;cursor:pointer}
+#spf-body input[type="checkbox"]{-webkit-appearance:checkbox!important;appearance:checkbox!important;
+  display:inline-block!important;visibility:visible!important;opacity:1!important;
+  width:13px!important;height:13px!important;min-width:13px!important;min-height:13px!important;
+  max-width:none!important;max-height:none!important;margin:0 6px 0 0!important;padding:0!important;
+  border:0!important;background:#fff!important;position:static!important;float:none!important;
+  vertical-align:middle!important;accent-color:#0969da!important}
 #spf-save{padding:7px 0;border:0;border-radius:6px;cursor:pointer;
   background:#1f883d;color:#fff;font-size:13px;font-weight:600}
 #spf-save:disabled{background:#94d3a2;cursor:default}
@@ -1074,10 +1089,10 @@
     panel.innerHTML =
       '<div id="spf-head"><span>保存单文件网页 v' + VERSION + '</span><span id="spf-close" title="收起">&times;</span></div>' +
       '<div id="spf-body">' +
-      '<label><input type="checkbox" id="spf-lazy" checked> 还原懒加载图片</label>' +
-      '<label><input type="checkbox" id="spf-fonts" checked> 内联字体文件</label>' +
-      '<label><input type="checkbox" id="spf-scripts" checked> 移除脚本（推荐）</label>' +
-      '<label><input type="checkbox" id="spf-article" checked> 仅保存正文（默认选中）</label>' +
+      '<label><input type="checkbox" id="spf-lazy" checked' + BOX_STYLE + '> 还原懒加载图片</label>' +
+      '<label><input type="checkbox" id="spf-fonts" checked' + BOX_STYLE + '> 内联字体文件</label>' +
+      '<label><input type="checkbox" id="spf-scripts" checked' + BOX_STYLE + '> 移除脚本（推荐）</label>' +
+      '<label><input type="checkbox" id="spf-article" checked' + BOX_STYLE + '> 仅保存正文（默认选中）</label>' +
       '<div id="spf-row">' +
       '<button id="spf-save">保存为单个 HTML 文件</button>' +
       '<button id="spf-copy" title="复制完整日志和未内联的图片地址">复制日志</button>' +
