@@ -2,8 +2,8 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.10.11
-// @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因
+// @version      1.13.0
+// @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因；AI 问答页（Gemini 这类）按“提问→回答”逐轮保留，shadow DOM 里的公式和列表不再存成空壳
 // @author       CodeBuddy
 // @match        *://*/*
 // @grant        GM.xmlHttpRequest
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.11';
+  const VERSION = '1.13.0';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -35,7 +35,11 @@
     canvasReferrer: 'no-referrer',  // canvas 兜底发不带 Referer；图片 403 可试 'origin'
     keepFonts: true,         // 仅正文模式下也保留页面正文字体 / 图标符号的样式
     fontFetch: true,         // 字体、CSS 这类非图片资源先用普通 fetch 试（服务器必须带 CORS 头）
-    mathFallback: true       // 正文里有 LaTeX 公式且已移除脚本时，留一条联网渲染公式的后备脚本
+    mathFallback: true,      // 正文里有 LaTeX 公式且已移除脚本时，留一条联网渲染公式的后备脚本
+    fontSlim: true,          // 正文模式只内联正文真正用到的 @font-face，其余丢掉（知乎图标字体抓不到时自动退回全留）
+    fontFaceCap: 24,         // 瘦身后最多留几个 @font-face 家族
+    chatMode: true,          // 识别 AI 问答页：正文盒上提到整个会话，逐轮保留提问和回答
+    shadowLift: true         // 把 shadow DOM 的内容搬进宿主子节点，否则 KaTeX 公式、组件代码块存出来是空壳
   };
 
   const LAZY_SRC = ['data-src', 'data-original', 'data-lazy-src', 'data-echo', 'data-actualsrc',
@@ -385,6 +389,111 @@
     // 常见的占位 class 不影响，交给 CSS 内联处理
   }
 
+  /* ---------------- Shadow DOM 展开 ----------------
+     Gemini 这类站点把 KaTeX 公式、代码块、图标渲染在 shadow root 里：宿主标签自己
+     不含内容。document.cloneNode(true) 虽然会连 shadow 树一起克隆，但最后输出走
+     outerHTML，而 outerHTML 不序列化 shadow 内容 —— 存下来就是
+     <span class="katex"></span> 这种空壳，整篇公式全丢。
+     这里在克隆出来的文档上按“原节点 ↔ 克隆节点”成对下钻，把每个开放 shadow root 的
+     子节点搬进宿主元素的普通子节点，后续的资源收集、正文提取、序列化就全都看得见 */
+  let shadowCss = [];              // 攒起来的 shadow 样式，最后作为一段 <style> 挂进文档
+  const shadowCssSeen = new Set();
+  const SHADOW_HOST = 'spf-shadow-host';
+  let shadowLifted = 0;
+  const SHADOW_CAP = 3000;         // 展开上限：整站都是 Web Component 时也不至于把文件撑爆
+
+  /* :host / ::slotted 只在 shadow 树里合法，搬到文档上下文必须改写选择器，
+     否则整条规则被浏览器判为无效直接丢掉（KaTeX 的样式大量用 :host 定宿主尺寸）。
+     近似改写：宿主元素统一打上 SHADOW_HOST 类 */
+  function scopeShadowCss(text) {
+    return (text || '')
+      .replace(/::slotted\(([^)]*)\)/gi, '.' + SHADOW_HOST + ' $1')
+      .replace(/:host\([^)]*\)/gi, '.' + SHADOW_HOST)
+      .replace(/:host\b/gi, '.' + SHADOW_HOST);
+  }
+
+  /* adoptedStyleSheets 是 JS 对象不是节点，克隆时不会带过来，只能读 cssText 自己搬。
+     Firefox 里构造样式表的 cssText 有可能是空的，退回逐条规则拼一遍 */
+  function shadowSheetTexts(sr) {
+    const out = [];
+    try {
+      Array.from(sr.adoptedStyleSheets || []).forEach(s => {
+        if (!s) return;
+        let t = '';
+        try { t = s.cssText || ''; } catch (e) { t = ''; }
+        if (!t) {
+          try { t = Array.from(s.cssRules || []).map(r => r.cssText).join('\n'); } catch (e) { t = ''; }
+        }
+        if (t) out.push(t);
+      });
+    } catch (e) { /* 读不了就算了 */ }
+    return out;
+  }
+
+  function pushShadowCss(text) {
+    const t = scopeShadowCss(text).trim();
+    if (t && !shadowCssSeen.has(t)) { shadowCssSeen.add(t); shadowCss.push(t); }
+  }
+
+  /* closed shadow root 的引用浏览器不会挂在 el.shadowRoot 上，但渲染框架自己几乎
+     都把它存成了实例属性（Lit 的 renderRoot、老 Angular/shady 的 _shadowRoot 等），
+     照着这几个名字捞一把，命中就能照常展开 */
+  function shadowOf(el) {
+    if (!el) return null;
+    const names = ['shadowRoot', 'renderRoot', '_shadowRoot', '__shadowRoot', 'shadyRoot', 'shadow_'];
+    for (const n of names) {
+      let v = null;
+      try { v = el[n]; } catch (e) { continue; }
+      if (v && typeof v.querySelectorAll === 'function') return v;
+    }
+    /* 名字猜不到就穷举这个元素身上的属性（含 Symbol 键，Angular/Tiger 都往符号键上挂）。
+       只认 host 指回自己的那个 root，别把随便一个 DocumentFragment 当成 shadow 树搬出来。
+       穷举有成本，只花在“可能是自定义元素或公式宿主”身上 */
+    const tag = (el.tagName || '');
+    const looksMath = /katex|math|mjx/i.test(typeof el.className === 'string' ? el.className : '');
+    if (tag.indexOf('-') < 0 && !looksMath) return null;
+    const vals = [];
+    try { vals.push.apply(vals, Object.values(el)); } catch (e) { /* 读不到就算了 */ }
+    try {
+      Object.getOwnPropertySymbols(el).forEach(sym => {
+        try { vals.push(el[sym]); } catch (e) { /* 个别 getter 会抛 */ }
+      });
+    } catch (e) { /* 拿不到符号键 */ }
+    for (const v of vals) {
+      if (v && typeof v.querySelectorAll === 'function' && v.host === el) return v;
+    }
+    return null;
+  }
+
+  function liftShadow(orig, clone) {
+    if (!orig || !clone || shadowLifted >= SHADOW_CAP) return;
+    const oc = Array.from(orig.children || []), cc = Array.from(clone.children || []);
+    for (let i = 0; i < oc.length && i < cc.length; i++) liftShadow(oc[i], cc[i]);
+    const sr = shadowOf(orig);
+    if (!sr) return;
+    shadowLifted++;
+    shadowSheetTexts(sr).forEach(pushShadowCss);
+    if (clone.classList) clone.classList.add(SHADOW_HOST);
+    /* shadow 里的 <style> 跟着内容一起搬出来（稍后集中到文档级）；<slot> 序列化后是空的，
+       真正被分发的轻 DOM 内容仍在宿主自己的子节点里，两边不会重复一遍正文 */
+    Array.from(sr.childNodes).forEach(node => {
+      const c = node.cloneNode(true);
+      clone.appendChild(c);
+      if (node.nodeType === 1) liftShadow(node, c);
+    });
+  }
+
+  /* shadow 组件自带的 <style> 挪到文档级：正文模式会把原页面样式表全删掉，
+     留在正文子树里的会被一起删，挪出来才能和 adoptedStyleSheets 一起补回去 */
+  function gatherShadowStyles(doc) {
+    let moved = 0;
+    doc.querySelectorAll('.' + SHADOW_HOST + ' style').forEach(s => {
+      if (s.textContent) { pushShadowCss(s.textContent); moved++; }
+      s.remove();
+    });
+    return moved;
+  }
+
   /* ---------------- 正文提取 ---------------- */
   const NEGATIVE_RE = /comment|meta|footer|footnote|sidebar|share|related|advert|banner|nav[-_]?bar/i;
   const POSITIVE_RE = /post|entry|article|body|content|main|text/i;
@@ -407,6 +516,7 @@
   let fontCssText = '';
   const fontCssUrls = new Set();
   let fontCssDown = [];      // 下载回来的外链 CSS：[{url, text}]
+  let fontFaceStats = { total: 0, kept: 0, slim: false };   // @font-face 瘦身前后的条数
   // 本次正文里有没有公式 / 代码 / 表格：决定要不要把对应的原文样式一起留下来
   let articleFlags = { math: false, code: false, table: false };
   let articleTitle = '';   // 正文模式定位到的文章标题，文件名优先用它
@@ -430,13 +540,27 @@
     return out;
   }
 
+  /* @font-face 里的 font-family 名（可能带引号、可能是 "X", serif 这种栈） */
+  function faceFamily(t) {
+    const m = /font-family\s*:\s*(?:"([^"]*)"|'([^']*)'|([^;}"']+))/i.exec(t || '');
+    return ((m && (m[1] || m[2] || m[3]) || '').trim()).replace(/^["']|["']$/g, '');
+  }
+
   function collectFontCss() {
     const rules = [], seenRule = new Set();
     const keep = t => { t = (t || '').trim(); if (t && !seenRule.has(t)) { seenRule.add(t); rules.push(t); } };
-    // @font-face 一律保留：知乎把图标字体按 unicode-range 切成多个子集，
-    // 猜“正文用到哪个 family”很容易漏，漏一个就是方块字。数量由下面的上限兜住。
-    const FACE_CAP = 40;
-    let faceKept = 0;
+    /* @font-face 先全捞进 faces，最后按“正文到底用没用到这个 family”筛掉一批。
+       知乎把图标字体按 unicode-range 切成多个子集，同一个 family 会有好几条规则，
+       所以去重键必须是整条规则文本，不能只按 family */
+    const faces = [], seenFace = new Set();
+    const FACE_SCAN_CAP = 200;
+    const addFace = t => {
+      t = trimFace(t);
+      const key = t.trim();
+      if (!key || seenFace.has(key) || faces.length >= FACE_SCAN_CAP) return;
+      seenFace.add(key);
+      faces.push({ text: key, fam: faceFamily(key).toLowerCase() });
+    };
     // 正文里有公式 / 代码 / 表格时，光留 @font-face 不够：
     // 公式会散成没有上下标、没有根号的一行乱字，代码会丢掉高亮配色，表格会丢掉边框表头
     const isMathRule = sel => articleFlags.math && /\.(katex|MathJax|mjx)/i.test(sel || '');
@@ -447,7 +571,7 @@
     // 同一字体常常同时给出 woff2 / woff / ttf 三份（KaTeX 一套就有 20 个 family），
     // 全内联会让文件平白胖几 MB。有 woff2 就只留它，后面那些备选源去掉：
     // 浏览器按 src 顺序挑，woff2 本来就排在最前面
-    const trimFace = t => {
+    function trimFace(t) {
       const m = /format\(\s*["']?woff2/i.exec(t);
       if (!m) return t;
       const brace = t.indexOf('}', m.index);
@@ -455,7 +579,7 @@
       const comma = t.indexOf(',', m.index);
       const cut = (comma > 0 && comma < brace) ? comma : brace;
       return t.slice(0, cut) + t.slice(brace);
-    };
+    }
     // a) 能直接读到的样式表（同源，或扩展已开 web-access）
     for (const sheet of Array.from(document.styleSheets)) {
       let rs = null;
@@ -464,7 +588,7 @@
         const t = (r.cssText || '').trim();
         if (!t) continue;
         if (r.type === CSSRule.FONT_FACE_RULE) {
-          if (faceKept++ < FACE_CAP) keep(trimFace(t));
+          addFace(t);
         } else if (r.selectorText && /\S::?(before|after)/i.test(r.selectorText)) {
           if (selTokens(r.selectorText).some(x => savedTokens.has(x))) keep(t);
         } else if (isMathRule(r.selectorText) || isCodeRule(r.selectorText) || isTableRule(r.selectorText)) {
@@ -478,9 +602,7 @@
       if (!txt.trim()) continue;
       const blockRe = /@font-face\s*\{[^}]*\}/gi;
       let m;
-      while ((m = blockRe.exec(txt)) !== null) {
-        if (faceKept++ < FACE_CAP) keep(trimFace(m[0]));
-      }
+      while ((m = blockRe.exec(txt)) !== null) addFace(m[0]);
       // 伪元素规则：逐块扫描（知乎的 CSS 常带换行，不能只按单行匹配）
       let i = 0;
       while (i < txt.length) {
@@ -504,7 +626,42 @@
         i = b + 1;
       }
     }
-    return rules.join('\n');
+    /* 瘦身：只留正文真正用到的 family。依据两条——
+       1) 上面挑中的那条规则（图标伪元素 / 公式 / 代码 / 表格）自己声明的 font-family，
+          图标字体和 KaTeX 各 family 都是这样被正文引用的；
+       2) family 名的分词命中正文里的 class/id（字体名常和图标类名同源，如 iconfont）。
+       抓不到任何依据时退回原样全留：宁可胖，也不要漏一个子集变成方块字 */
+    const used = new Set();
+    // font: 简写里家族名前面还挂着字号、字重这些，得先剥掉；通用字体族本身不是 @font-face 目标
+    const SKIP_WORD = /^(normal|bold|bolder|lighter|italic|oblique|small-caps|caption|icon|menu|message-box|small-caption|status-bar|inherit|initial|unset|revert|auto|serif|sans-serif|monospace|cursive|fantasy|system-ui|ui-monospace|ui-serif|ui-sans-serif|math|emoji|linguistics)$/i;
+    const addFam = seg => {
+      seg = (seg || '').trim().toLowerCase().replace(/^["']|["']$/g, '').trim();
+      if (!seg) return;
+      const parts = seg.split(/\s+/).filter(w => w && !SKIP_WORD.test(w) &&
+        !/^[0-9.]+(px|em|rem|pt|pc|in|cm|mm|ex|ch|%)$/.test(w) && !/^var\(/i.test(w));
+      if (!parts.length) return;
+      used.add(parts.join(' '));
+      parts.forEach(p => { if (p.length > 2) used.add(p); });
+    };
+    const ruleText = rules.join('\n');
+    // 图标伪元素规则里的 font-family、KaTeX 规则里的 font 简写，都是“正文确实用到这个 family”的证据
+    (ruleText.match(/font-family\s*:[^;{}]+/gi) || []).forEach(d =>
+      d.replace(/^font-family\s*:/i, '').split(',').forEach(addFam));
+    (ruleText.match(/(?:[{;\s])font\s*:\s*[^;{}]+/gi) || []).forEach(d =>
+      d.replace(/^[^:]*:/, '').split(',').forEach(addFam));
+    const famHit = f => {
+      if (!f) return false;
+      if (used.has(f)) return true;
+      return f.split(/[^a-z0-9_-]+/).some(x => x.length > 2 && savedTokens.has(x));
+    };
+    let picked = faces;
+    if (CFG.fontSlim && used.size) {
+      const hit = faces.filter(x => famHit(x.fam));
+      if (hit.length) picked = hit;
+    }
+    if (CFG.fontSlim && picked.length > CFG.fontFaceCap) picked = picked.slice(0, CFG.fontFaceCap);
+    fontFaceStats = { total: faces.length, kept: picked.length, slim: picked.length < faces.length };
+    return picked.map(x => x.text).join('\n') + (picked.length && rules.length ? '\n' : '') + rules.join('\n');
   }
 
   /* 知乎把未读消息数塞进 document.title：
@@ -522,12 +679,99 @@
     return t.trim() || raw;
   }
 
+  /* 正文提取要先把样式表、导航这类样板从快照里删掉才好打分，但“没认出正文”时
+     上层会拿同一个 doc 回退整页 —— 删都删了，存出来就是一张没样式的裸页。
+     所以删除动作记在 cut 里，失败时按原位插回去 */
+  /* 展开完还是空的公式宿主：光看保存结果分不出“浏览器不让读”还是“页面压根没渲染”，
+     所以就地探一个宿主，把能问到的都写进日志——shadowRoot 是不是 null、框架有没有把
+     root 存成实例属性、元素有没有尺寸、命中的是不是宿主自己。有了这几行才知道下一步
+     该往哪儿捞，不用来回让人贴控制台输出 */
+  const MATH_SEL = '.katex,.katex-display,.mjx-container,math,[class*="katex"]';
+  /* 只剩空壳的公式宿主。.katex-display 里套着一个 .katex，同一处公式会数两遍，
+     所以只认最外面那一层 */
+  function mathShells(root) {
+    if (!root || !root.querySelectorAll) return [];
+    let list;
+    try {
+      list = Array.from(root.querySelectorAll(MATH_SEL))
+        .filter(el => !(el.textContent || '').trim() && !el.querySelector('svg,math,img'));
+    } catch (e) { return []; }
+    return list.filter(el => !el.parentElement || !el.parentElement.closest(MATH_SEL));
+  }
+  /* KaTeX 把渲染结果整块包在 <span class="katex-html" aria-hidden="true"> 里（MathJax 的
+     assistive 层同理）：这个 aria-hidden 是“别让屏幕阅读器念两遍”的意思，不是装饰。
+     按装饰删掉，公式就只剩 <span class="katex"></span> 一个空壳，整篇数学全丢 */
+  const MATH_HOST_SEL = '.katex,.katex-display,.mjx-container,.mjx-chtml,.MathJax,.MathJax_Display,' +
+    '.MathJax_SVG,math,semantics,annotation,mspace,mrow,[data-katex]';
+  function inMathTree(el) {
+    if (!el || !el.closest) return false;
+    try { return !!el.closest(MATH_HOST_SEL); } catch (e) { return false; }
+  }
+  function probeMath() {
+    const empty = mathShells(document);
+    if (!empty.length) return 0;
+    const one = empty[0];
+    const clsOf = el => (typeof el.className === 'string' ? el.className.trim().split(/\s+/)[0] : '');
+    const chain = [];
+    for (let a = one, n = 0; a && n < 6; a = a.parentElement, n++) {
+      chain.push(a.tagName.toLowerCase() + (clsOf(a) ? '.' + clsOf(a) : ''));
+    }
+    const props = [];
+    ['shadowRoot', 'renderRoot', '_shadowRoot', '__shadowRoot', 'shadyRoot', 'shadow_'].forEach(n => {
+      let v = null;
+      try { v = one[n]; } catch (e) { v = '读取异常'; }
+      props.push(n + '=' + (v && typeof v === 'object' ? (v.querySelectorAll ? 'root(' + v.childNodes.length + ')' : 'obj') : String(v)));
+    });
+    const r = one.getBoundingClientRect();
+    let hit = '取不到';
+    try {
+      const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      hit = h ? h.tagName.toLowerCase() + (clsOf(h) ? '.' + clsOf(h) : '') + (h === one ? '（就是宿主自己）' : '') : 'null';
+    } catch (e) { /* 元素不在视口里，elementFromPoint 会返回 null，不算异常 */ }
+    const own = Object.keys(one).slice(0, 14);
+    const strProps = own.filter(k => typeof one[k] === 'string' && one[k])
+      .map(k => k + '="' + String(one[k]).slice(0, 60) + '"');
+    log('公式宿主探针：<' + one.tagName.toLowerCase() + '> 属性[' +
+      Array.from(one.attributes).map(a => a.name + '=' + String(a.value).slice(0, 40)).join(' ') + '] ' +
+      props.join(' ') + ' 尺寸=' + Math.round(r.width) + '×' + Math.round(r.height) +
+      ' 命中=' + hit + ' 祖先=' + chain.join('<') +
+      ' 自有键=' + (own.join(',') || '无') + (strProps.length ? ' 字符串属性=' + strProps.join(' ') : ''));
+    return empty.length;
+  }
+
   function candidatesToMain(doc) {
+    const cut = [];
+    doc.querySelectorAll('script,style,noscript,link,iframe,form,nav,header,footer,aside,[hidden],[aria-hidden="true"]')
+      .forEach(el => {
+        // 公式子树里的 aria-hidden / hidden 是排版语义，不是可丢的装饰，见 inMathTree
+        if (inMathTree(el) && (el.hasAttribute('aria-hidden') || el.hasAttribute('hidden'))) return;
+        const p = el.parentNode;
+        if (!p) return;
+        cut.push([el, p, el.nextSibling]);
+        p.removeChild(el);
+      });
+    let main = null;
+    try {
+      main = pickMain(doc);
+    } finally {
+      // 抛异常也算失败，一样得把删掉的东西放回原处
+      if (!main) {
+        // 倒序插回：正序时后一个兄弟还捏在 cut 里没上树，insertBefore 会抛错只能 append，
+        // 结果顺序就乱了。倒着来，每个节点的 next 都已经回到原位
+        for (let i = cut.length - 1; i >= 0; i--) {
+          const [el, p, next] = cut[i];
+          try { p.insertBefore(el, next); } catch (e) { p.appendChild(el); }
+        }
+        // 定位正文起点时打的标记，回退路径上没人清理
+        doc.querySelectorAll('[data-spf-start]').forEach(el => el.removeAttribute('data-spf-start'));
+      }
+    }
+    return main;
+  }
+
+  function pickMain(doc) {
     const norm = s => (s || '').replace(/\s+/g, '');
     const dbg = m => console.log('[SPF] ' + m);
-    // 1) 去掉样板噪音
-    doc.querySelectorAll('script,style,noscript,link,iframe,form,nav,header,footer,aside,[hidden],[aria-hidden="true"]')
-      .forEach(el => el.remove());
     // 2) 文本块 -> 候选容器（正文可能是 <p>，也可能是裸文本 <div>+<br>）
     const cRe = /article|section|div|main|td/;
     const bRe = /^(P|PRE|BLOCKQUOTE|DIV|SECTION|ARTICLE|MAIN|TD|LI|DT|DD|H[1-6])$/;
@@ -650,6 +894,59 @@
     }
     dbg('正文盒: <' + best.tagName.toLowerCase() + ' id="' + (best.id || '') + '" class="' +
       (typeof best.className === 'string' ? best.className : '') + '"> paras=' + parasOf(best) + ' score=' + Math.round(bestScore));
+    /* 4b) AI 问答页：上面按段落打分挑出来的十有八九是“最后一条回答”那一个气泡
+       （Gemini 的 .markdown-main-panel、ChatGPT 的 [data-message-author-role]），
+       用户提问和其它轮次都在它外面，直接保存就只剩半截对话。识别到会话容器时
+       把正文盒上提，按“提问 → 回答”的文档顺序逐轮保留 */
+    let chatBox = false;
+    if (CFG.chatMode) {
+      // “回答块”标记：数它有几个才知道这是不是一轮以上的会话
+      const ANSWER_SEL = '.markdown-main-panel,.markdown-body,.ProseMirror,' +
+        '[class*="model-response"],[class*="message-content"],[class*="response-container"],' +
+        '[class*="message-bubble"],[data-message-author-role]';
+      // 提问气泡只用来认“这是问答页”，不参与轮次计数：
+      // 一个 .turn 里就有一问一答两个块，按它数会把每一轮都当成会话列表，
+      // 上提停在第一轮里，第二轮照样丢
+      const TURN_SEL = ANSWER_SEL + ',[class*="user-query"],[class*="message-content-user"]';
+      const count = (el, sel) => { try { return el.querySelectorAll(sel).length; } catch (e) { return 0; } };
+      /* 轮数只能数“最外层”的回答块：一条回答往往是 .response-container 套着
+         .markdown-main-panel，气泡底下还挂着 .model-response-footer 这类操作条，
+         按原始命中数算一条能数出四五个，于是“这条气泡其实只有一轮”会被误判成
+         “已经是多轮容器”，上提直接跳过，存的还是单轮。
+         操作条必须从计数里剔掉：Gemini 一条回答里 .model-response-footer +
+         .message-content-actions 就能凑够 2，往上找的那一步于是停在单轮容器上 */
+      const CHROME_YARD_RE = /footer|toolbar|action|vote|feedback|thumb|share|regenerate|cursor/i;
+      const answerBlocks = el => {
+        let list = [];
+        try { list = Array.from(el.querySelectorAll(ANSWER_SEL)); } catch (e) { return 0; }
+        if (list.length > 400) return list.length;
+        list = list.filter(n => !CHROME_YARD_RE.test(cls(n)));
+        return list.filter(n => !list.some(o => o !== n && o.contains(n))).length;
+      };
+      if (answerBlocks(best) < 2 && count(doc.body, TURN_SEL) >= 2) {
+        const oneTurn = norm(best.textContent).length;
+        /* 认类名靠不住：Gemini 每一轮自己就套着一个 .conversation-container，
+           它在文档里排在回答前面，提问在它外面。停在“第一个像会话容器的祖先”上，
+           存出来还是只有一轮。所以一路往上数，取“回答块最多”的那一层；
+           文字量突然翻好几倍说明已经窜到整页布局，那层就不要了 */
+        let want = null, wantN = answerBlocks(best);
+        for (let a = best.parentNode; a && a !== doc.body; a = a.parentNode) {
+          const n = answerBlocks(a);
+          if (n < 2 || n <= wantN || outsideWin(a)) continue;
+          if (norm(a.textContent).length > Math.max(6000, oneTurn * 10)) break;
+          want = a;
+          wantN = n;
+        }
+        if (want) {
+          best = want;
+          chatBox = true;
+        } else {
+          dbg('问答页：往上找不到同时装着多轮回答的容器，只保留当前这一轮');
+        }
+      }
+      if (chatBox) dbg('问答页：正文盒上提到会话容器 <' + best.tagName.toLowerCase() +
+        ' class="' + cls(best) + '">，圈进 ' + answerBlocks(best) + ' 个回答块');
+    }
     // 5) 只平铺合格的文字块/图片块，不克隆任何容器结构
     savedTokens = new Set();
     // 只收正文盒里的 class/id，否则整页的图标类名都会命中，拽进一堆用不到的字体
@@ -690,10 +987,12 @@
         cur = cur.parentNode;
       }
     };
-    if (best.parentNode) markStart(best);
+    // 问答盒的开头往往是侧栏标题、模型选择器之类，按“上一兄弟是标题”找正文起点
+    // 只会搬错东西，这种情况直接用页面标题生成 h1
+    if (best.parentNode && !chatBox) markStart(best);
     // 没按页面标题定位成功时，退回老办法：正文盒里的第一个标题当文章标题。
     // 已经定位到 hTitle 就不要乱标盒内的标题，免得把正文里的小标题吞掉
-    if (!hTitle) {
+    if (!hTitle && !chatBox) {
       const inBox = best.querySelector('h1,h2,h3');
       if (inBox && norm(inBox.textContent).length < 120) {
         inBox.dataset.spfStart = '1';
@@ -701,6 +1000,10 @@
       }
     }
     const SECTION_RE = /精选|栏目|列表|推荐|热门|相关|更多|专题|标签|阅读|评论|关注/;
+    /* “推荐/相关/精选”这类栏目词判杂质。问答模式下正文盒已经收到会话容器里了，
+       提问和回答里出现“推荐个发行版”“相关阅读…”这种词太正常，按栏目词误杀会把
+       整条提问丢掉；这里只让又短、又确实是界面标签的行（“相关内容”“查看引用”）命中 */
+    const sectionNoise = (s, t) => SECTION_RE.test(s) && (!chatBox || t < 20);
     const okBlock = el => {
       const t = norm(el.textContent).length;
       // 只有几乎没文字的块才算“图片行”；正文段落里夹一张图、末尾再挂几条参考链接时
@@ -711,7 +1014,7 @@
       if (img) return t === 0 || lt / t < 0.4;  // 正文图：纯图行或低文案
       if (t < 20) return false;                  // 碎屑（含空行）
       if (t < 60 && lt > 0 && !/https?:\/\/|www\./i.test(el.textContent || '')) return false; // 短条目行：栏目列表/日期条目
-      if (t < 80 && SECTION_RE.test(el.textContent)) return false;
+      if (t < 80 && sectionNoise(el.textContent, t)) return false;
       return true;
     };
     // 5) 递归收集正文盒内的“叶子块”：只认“里面没有别的块级元素”的最内层文字块，
@@ -724,14 +1027,44 @@
     // （如 .markdown_views .prism .token.comment / .markdown_views table tr），
     // 拆成一段段 <p> 就再也命中不了，所以这两种整块保留、不往下钻
     const CODE_BOX_RE = /(prism|highlight|hljs|prettyprint|syntax|language-|code)/i;
+    // 纯链接列表（导航条、相关阅读、友情链接）：文字几乎全在 <a> 里，不是正文
+    const isLinkList = el => {
+      const t = norm(el.textContent).length;
+      if (!t) return true;
+      return linkTextOf(el) / t > 0.5;
+    };
+    /* Gemini 这类问答站会在句子中间插引用：一个 <source-footnote> 角标，紧跟一个来源条
+       <div dir="auto"><span style="max-width: 20ch">腾讯云 - Tencent</span></div>。
+       原样搬进离线文件，正文里就多出“Tiny Core / 腾讯云 - Tencent”这种断句碎片。
+       ch 单位的 max-width 是它按文字宽度自适应的写法，认这个特征比认 Angular
+       动态生成的 _ngcontent-* 属性可靠得多 */
+    const CHIP_RE = /max-width:\s*\d+(?:\.\d+)?ch/i;
+    const CITE_RE = /source-footnote|footnote-sup|citation|cdc-itibar|cdc-lib/i;
+    const isCitation = el => {
+      if (el.tagName.toLowerCase() === 'source-footnote' ||
+          CITE_RE.test(cls(el)) || CITE_RE.test(el.id || '')) return true;
+      const t = norm(el.textContent).length;
+      if (!t || t > 30) return false;              // 来源条就是站点名，长不了
+      if (CHIP_RE.test(el.getAttribute('style') || '')) return true;
+      return /^(div|span|a|p|li)$/.test(el.tagName.toLowerCase()) &&
+        Array.from(el.querySelectorAll('[style]')).some(n => CHIP_RE.test(n.getAttribute('style') || ''));
+    };
+    // 交互外壳：代码块的“复制/下载”按钮、图标按钮、引用角标，离线文件里点不动，留着只是噪音
+    const CHROME_SEL = 'button, [role="button"], input[type="button"], [class*="icon-button"], ' +
+      '[class*="copy-button"], mat-icon, gem-icon, gem-icon-button, source-footnote, [class*="source-footnote"]';
     const blocks = [];
     (function walk(node) {
       Array.from(node.children).forEach(c => {
         if (c.hasAttribute('data-spf-start') || c === hTitle) return; // 标题单独放在最前面
         if (!inWindow(c)) { walk(c); return; } // 罩住别篇文章的容器：钻进去继续找
+        if (isCitation(c)) return;             // 引用碎片整块丢掉，不往下钻
         if (c.tagName === 'IMG') { blocks.push(c); return; }
         if (c.tagName === 'TABLE' && (c.querySelectorAll('tr').length >= 2 ||
             norm(c.textContent).length >= 80)) { blocks.push(c); return; }
+        /* 列表整块保留：<li> 常见写成“行首粗体小标题 + 内层 <p> 说明”，往下钻只会
+           收走内层 <p>，小标题和 1./2. 编号一起丢，存出来就是散装段落看着缺一段。
+           纯链接列表（导航、相关阅读）不适用，照旧下钻当杂质处理 */
+        if ((c.tagName === 'UL' || c.tagName === 'OL') && !isLinkList(c)) { blocks.push(c); return; }
         if (/^(DIV|FIGURE|SECTION)$/.test(c.tagName) && CODE_BOX_RE.test(cls(c)) &&
             c.querySelector('pre,code') &&
             !c.querySelector('p,h1,h2,h3,h4,h5,h6,li,blockquote,table')) {
@@ -757,15 +1090,19 @@
       const lt = linkTextOf(el);
       if (img) return (t === 0 || lt / t < 0.4) ? 2 : 0;
       // 正文里的裸链接（文尾参考资料、出处/链接行）也是正文，不能因链接密度被踢掉
-      if (t > 0 && t < 200 && URLISH_RE.test(s) && !SECTION_RE.test(s)) return 2;
+      if (t > 0 && t < 200 && URLISH_RE.test(s) && !sectionNoise(s, t)) return 2;
       if (t >= 35 && lt / t < 0.5) return 2;
-      if (t > 0 && lt === 0 && !SECTION_RE.test(s)) return 1;
+      if (t > 0 && lt === 0 && !sectionNoise(s, t)) return 1;
       return 0;
     });
     const charsAt = i => norm(blocks[i].textContent).length;
     const bodyIdx = kind.map((k, i) => k === 2 ? i : -1).filter(i => i >= 0);
     if (!bodyIdx.length) { dbg('正文盒内没有正文长段/图片行，回退整页'); return null; }
-    const first = bodyIdx[0];
+    let first = bodyIdx[0];
+    /* 问答页：会话开头那句提问只有十几个字，判成“短标题行”排在第一个正文段前面，
+       而窗口是从第一个正文段起算的，于是第一轮的问题被单独切在窗口外（第二轮的问题
+       在窗口中间反而能留下）。往回并上紧邻的短行，每一轮的提问才齐全 */
+    if (chatBox) { while (first > 0 && kind[first - 1] === 1) first--; }
     let last = bodyIdx[bodyIdx.length - 1];
     const tailFrom = last + 1;
     // 紧跟正文末尾的短行（作者/出处/链接等）一并保留，最多 6 行
@@ -774,7 +1111,7 @@
       const s = el.textContent || '';
       const t = norm(s).length;
       const img = el.tagName === 'IMG' || !!el.querySelector('img');
-      if ((!t && !img) || t > 200 || SECTION_RE.test(s)) break;
+      if ((!t && !img) || t > 200 || sectionNoise(s, t)) break;
       last = i;
     }
     let total = 0;
@@ -840,6 +1177,8 @@
         node = el.cloneNode(true);
       }
       node.removeAttribute('data-spf-start');
+      // 代码块外壳整块保留时，里面的“复制/下载代码”按钮一起进来了，剥掉
+      if (node.querySelectorAll) node.querySelectorAll(CHROME_SEL).forEach(b => b.remove());
       cleanLayout(node);
       wrap.appendChild(node);
     };
@@ -948,6 +1287,9 @@
     // 正文用到的字体 / 图标符号样式：内容由主流程第 3 步补进去（@font-face 里的
     // url() 会跟着一起被内联），没抓到规则时留空注释便于排查
     add('style', { 'data-href': '(正文用字体/图标样式)' }, fontCssText || '/* 未提取到 @font-face */');
+    // shadow DOM 里搬出来的组件样式（KaTeX 公式、代码块外壳）：正文模式把原页面样式表
+    // 全删了，不补这一段的话公式虽然内容还在，也会散成一行没有排版的乱字
+    if (shadowCss.length) add('style', { 'data-href': '(shadow DOM 组件样式)' }, shadowCss.join('\n'));
     if (CFG.mathFallback && doc.body &&
         /(\$\$|\\\(|\\\[(\\begin\{|\(image|公式|latex))/i.test(doc.body.textContent || '')) {
       // 公式脚本被移除后 LaTeX 只剩源码，这里留一条联网渲染的后备（离线不生效）
@@ -1166,9 +1508,35 @@
       fontCssText = '';
       fontCssDown = [];
       fontCssUrls.clear();
+      fontFaceStats = { total: 0, kept: 0, slim: false };
+      shadowCss = [];
+      shadowCssSeen.clear();
+      shadowLifted = 0;
       logLines.length = 0;
       missingMsgs = [];
       const doc = document.cloneNode(true);
+      /* shadow DOM 必须在取快照这一步就展开：正文提取、资源收集、最后的 outerHTML
+         序列化全都只看轻 DOM，晚一步 KaTeX 公式就已经是个空壳了 */
+      let shadowStyles = 0;
+      if (CFG.shadowLift) {
+        try {
+          liftShadow(document.documentElement, doc.documentElement);
+          shadowStyles = gatherShadowStyles(doc);
+          if (shadowCss.length) {
+            const st = doc.createElement('style');
+            st.setAttribute('data-href', '(shadow DOM 组件样式)');
+            st.textContent = shadowCss.join('\n');
+            (doc.head || doc.documentElement).appendChild(st);
+          }
+        } catch (e) { console.warn('[SPF] shadow DOM 展开失败：' + (e && e.message)); }
+      }
+      if (shadowLifted) status('shadow DOM：展开 ' + shadowLifted + ' 个组件，样式 ' + shadowStyles + ' 段');
+      /* 公式渲染在 closed shadow root 里时脚本读不到 shadowRoot，搬不出内容，
+         轻 DOM 只剩 <span class="katex"></span> 一个空壳。这种必须说清楚，
+         否则用户只看到“公式全没了”，根本猜不到是浏览器不让读 */
+      const emptyMath = probeMath();
+      if (emptyMath) note('公式：' + emptyMath + ' 处展开后仍是空的，渲染结果在脚本读不到的地方' +
+        '（多半是 closed shadow root），细节看日志里的“公式宿主探针”', true);
       const lazy = opt('spf-lazy'), fonts = opt('spf-fonts'), noScript = opt('spf-scripts');
       const keepFontCss = CFG.keepFonts && fonts;
       if (lazy) unlazy(doc);
@@ -1189,6 +1557,11 @@
           extractArticle(doc, main);
           const hid = hideTexSource(doc.body);
           if (hid) note('公式：隐藏 ' + hid + ' 处 LaTeX 源码副本，保留渲染好的 <math>');
+          /* 上面探针查的是页面上的实时 DOM，这里查的是保存结果：页面上有内容而存出来
+             是空壳，说明是清理/提取这一步把公式删了，不是浏览器不让读。少了这一行，
+             自己删掉的东西只能靠人肉对比文件看出来 */
+          const lost = mathShells(doc.body).length;
+          if (lost) note('公式：保存结果里还有 ' + lost + ' 处空壳，页面上原本有内容，是提取过程丢的', true);
         }
       }
 
@@ -1407,10 +1780,15 @@
           : fontCssGot === 0 ? '（样式表一张都没拿到：无 GM 权限且对方不给 CORS 头）'
           : fontKeptRules === 0 ? '（' + fontCssGot + '/' + fontCssWant + ' 张样式表拿到了但里面没有 @font-face）' : '';
         note('字体/图标：样式表 ' + fontCssGot + '/' + fontCssWant +
-          '，抓到规则 ' + fontKeptRules + ' 条，涉及字体文件 ' +
+          '，抓到规则 ' + fontKeptRules + ' 条，@font-face ' + fontFaceStats.kept + '/' + fontFaceStats.total +
+          (fontFaceStats.slim ? '（瘦身后丢掉 ' + (fontFaceStats.total - fontFaceStats.kept) + ' 个用不上的家族）' : '') +
+          '，涉及字体文件 ' +
           Array.from(seen).filter(u => FONT_EXT.test(u)).length + ' 个' + mnote,
           fontKeptRules === 0);
       }
+      if (shadowLifted) note('Shadow DOM：展开 ' + shadowLifted + ' 个组件（公式、代码块这类内容渲染在 shadow 里，' +
+        '不展开存出来是空壳），补回组件样式 ' + shadowCss.length + ' 段' +
+        (shadowLifted >= SHADOW_CAP ? '，到上限 ' + SHADOW_CAP + ' 个为止' : ''));
       if (!gmXhr) {
         note('无 GM.xmlHttpRequest 权限：图片走 canvas 兜底（尝试 ' + canvasTried +
           '、成功 ' + canvasSaved + '）；字体和样式表走普通 fetch，服务器必须带 CORS 头才能拿到',
