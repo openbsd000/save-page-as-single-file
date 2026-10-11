@@ -2,7 +2,7 @@
 // @name         保存网页为单 HTML 文件（图片内联）
 // @name:en      Save Page As Single HTML (inline images)
 // @namespace    https://gist.github.com/
-// @version      1.13.0
+// @version      1.13.1
 // @description  把当前页面保存成一个 .html 文件：图片 / CSS / 字体全部内联为 data URI，离线打开不丢图；仅保存正文时也会挑出正文用到的 @font-face 和图标符号样式一起内联；跨域走 GM 请求 → 普通 fetch → canvas 三级兜底，失败会明确报告原因；AI 问答页（Gemini 这类）按“提问→回答”逐轮保留，shadow DOM 里的公式和列表不再存成空壳
 // @author       CodeBuddy
 // @match        *://*/*
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.13.0';
+  const VERSION = '1.13.1';
 
   /* ---------------- 配置 ---------------- */
   const CFG = {
@@ -39,7 +39,9 @@
     fontSlim: true,          // 正文模式只内联正文真正用到的 @font-face，其余丢掉（知乎图标字体抓不到时自动退回全留）
     fontFaceCap: 24,         // 瘦身后最多留几个 @font-face 家族
     chatMode: true,          // 识别 AI 问答页：正文盒上提到整个会话，逐轮保留提问和回答
-    shadowLift: true         // 把 shadow DOM 的内容搬进宿主子节点，否则 KaTeX 公式、组件代码块存出来是空壳
+    shadowLift: true,        // 把 shadow DOM 的内容搬进宿主子节点，否则 KaTeX 公式、组件代码块存出来是空壳
+    mediaSizeLock: true      // 把图标在页面上的实际显示尺寸钉成内联样式：正文模式删掉页面 CSS 后，
+                             // 不带宽高的 <img>/<svg> 会掉回 300×150 的默认尺寸，一个图钉撑成一段那么大
   };
 
   const LAZY_SRC = ['data-src', 'data-original', 'data-lazy-src', 'data-echo', 'data-actualsrc',
@@ -492,6 +494,37 @@
       s.remove();
     });
     return moved;
+  }
+
+  /* ---------------- 图片 / 图标的实际显示尺寸 ----------------
+     X、知乎这类站点的 emoji、图钉、徽章是 <img src="….svg">，宽高写在页面 CSS 的 class
+     规则里，标签自己不带 width/height。正文模式把样式表和 class 一起删掉，这些图就退回
+     替换元素的默认尺寸 300×150 —— 一个 18px 的图标撑成一段那么大。
+     趁元素还挂在页面上量一次渲染尺寸，直接钉成克隆体的内联样式。
+     只钉两类：图标级的小图，以及任何尺寸的 <svg>（SVG 没有固有尺寸，不钉必塌）；
+     大图留给正文样式里的 max-width:100% 自适应，钉死反而会在窄栏里压扁 */
+  const MEDIA_RE = /^(IMG|svg|VIDEO|CANVAS)$/;
+  const ICON_MAX_PX = 128;
+  let mediaLocked = 0;
+  function lockMediaSize(orig, clone) {
+    if (!orig || !clone || mediaLocked >= SHADOW_CAP) return;
+    if (MEDIA_RE.test(orig.tagName) && !inMathTree(orig) && !clone.getAttribute('width')) {
+      const st = clone.getAttribute('style') || '';
+      if (!/(^|;)\s*(width|height)\s*:/i.test(st)) {
+        const r = orig.getBoundingClientRect();
+        const svg = orig.tagName === 'svg';
+        if (r.width >= 2 && r.height >= 2 &&
+            (svg || (r.width <= ICON_MAX_PX && r.height <= ICON_MAX_PX))) {
+          try {
+            clone.style.width = Math.round(r.width) + 'px';
+            clone.style.height = Math.round(r.height) + 'px';
+            if (clone.style.width) mediaLocked++;
+          } catch (e) { /* 个别节点没有 style，跳过 */ }
+        }
+      }
+    }
+    const oc = Array.from(orig.children || []), cc = Array.from(clone.children || []);
+    for (let i = 0; i < oc.length && i < cc.length; i++) lockMediaSize(oc[i], cc[i]);
   }
 
   /* ---------------- 正文提取 ---------------- */
@@ -1149,6 +1182,9 @@
       const els = root.tagName === 'IMG' ? [root] : [root].concat(Array.from(root.querySelectorAll('*')));
       els.forEach(el => {
         const math = !!(el.closest && el.closest(KEEP_SEL));
+        // 图片自己的内联尺寸（包括 lockMediaSize 刚钉上去的那一份）不能跟着“排版属性”
+        // 一起洗掉，否则正文样式表里 max-width:100% 会把它拉回 300×150 的默认尺寸
+        const media = /^(IMG|svg|VIDEO|CANVAS)$/.test(el.tagName);
         if (!math) LAYOUT_ATTRS.forEach(a => {
           // width/height 是 <img> 和 <svg> 的固有尺寸：删掉后 SVG 会掉回 300×150 的
           // 默认尺寸，公式里的重音/箭头小图标会被撑成一大块，所以这两个标签都豁免
@@ -1158,7 +1194,7 @@
         Array.from(el.attributes || []).forEach(at => {
           if (/^data-|^on/i.test(at.name)) el.removeAttribute(at.name);
         });
-        if (!math && el.hasAttribute('style')) {
+        if (!math && !media && el.hasAttribute('style')) {
           const rest = (el.getAttribute('style') || '')
             .split(';')
             .filter(d => d.trim() && !/^\s*(border|background|padding|margin|width|float|display|position|text-align)/i.test(d.trim()))
@@ -1512,9 +1548,18 @@
       shadowCss = [];
       shadowCssSeen.clear();
       shadowLifted = 0;
+      mediaLocked = 0;
       logLines.length = 0;
       missingMsgs = [];
       const doc = document.cloneNode(true);
+      /* 量尺寸要在克隆之后、其它改动之前做：这一步靠“原节点 ↔ 克隆节点”按子节点序号
+         配对，shadow 展开和样式搬运会改变克隆树的子节点序号，配错就给别的图钉错尺寸 */
+      if (CFG.mediaSizeLock) {
+        try {
+          lockMediaSize(document.documentElement, doc.documentElement);
+        } catch (e) { console.warn('[SPF] 图标尺寸固定失败：' + (e && e.message)); }
+      }
+      if (mediaLocked) status('图标尺寸：钉住 ' + mediaLocked + ' 个不带宽高的图片/SVG');
       /* shadow DOM 必须在取快照这一步就展开：正文提取、资源收集、最后的 outerHTML
          序列化全都只看轻 DOM，晚一步 KaTeX 公式就已经是个空壳了 */
       let shadowStyles = 0;
@@ -1786,6 +1831,8 @@
           Array.from(seen).filter(u => FONT_EXT.test(u)).length + ' 个' + mnote,
           fontKeptRules === 0);
       }
+      if (mediaLocked) note('图标尺寸：按页面实际渲染钉住 ' + mediaLocked + ' 个不带宽高的图片/SVG' +
+        '（这类图的尺寸原本写在页面 CSS 里，正文模式删掉样式表后它们会掉回 300×150 的默认尺寸）');
       if (shadowLifted) note('Shadow DOM：展开 ' + shadowLifted + ' 个组件（公式、代码块这类内容渲染在 shadow 里，' +
         '不展开存出来是空壳），补回组件样式 ' + shadowCss.length + ' 段' +
         (shadowLifted >= SHADOW_CAP ? '，到上限 ' + SHADOW_CAP + ' 个为止' : ''));
